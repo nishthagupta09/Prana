@@ -10,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
 
-from app.services.bedrock import BedrockExplanationService, ExplanationRequest
+from app.services.gemini import ExplanationRequest, GeminiExplanationService
 from app.services.open_meteo import HourlySeries, OpenMeteoError, OpenMeteoService
 
 
@@ -105,7 +105,7 @@ app.add_middleware(
 )
 
 open_meteo = OpenMeteoService()
-bedrock_explanations = BedrockExplanationService()
+explanation_service = GeminiExplanationService()
 
 
 def block_hours(block: PlanBlock) -> float:
@@ -432,4 +432,4 @@ def end_of_day(request: DayAnalysisRequest):
 @app.post("/api/explanations")
 @app.post("/api/insights")
 def explain(payload: ExplanationRequest):
-    return bedrock_explanations.explain(payload)
+    return explanation_service.explain(payload)

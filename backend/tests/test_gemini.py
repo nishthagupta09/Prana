@@ -2,12 +2,13 @@ import asyncio
 import json
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from httpx import ASGITransport, AsyncClient
 
 import app.main as api
-from app.services.bedrock import BedrockExplanationService, ExplanationRecommendation, ExplanationRequest
+from app.services.gemini import GeminiExplanationService, ExplanationRecommendation, ExplanationRequest
 
 
 def explanation_request(data_mode="live", scenario=None):
@@ -51,92 +52,116 @@ def explanation_request(data_mode="live", scenario=None):
     })
 
 
-def converse_response(text):
-    return {"output": {"message": {"content": [{"text": text}]}}}
+def generate_response(text):
+    return SimpleNamespace(text=text)
 
 
-class BedrockExplanationTests(unittest.TestCase):
+class GeminiExplanationTests(unittest.TestCase):
+    def test_environment_selects_api_key_and_model_and_sdk_timeout(self):
+        from google.genai import types
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-env-key", "GEMINI_MODEL": "gemini-test-flash"}):
+            service = GeminiExplanationService()
+        self.assertEqual(service.api_key, "test-env-key")
+        self.assertEqual(service.model, "gemini-test-flash")
+        with patch("google.genai.Client") as sdk_client:
+            service._client()
+        sdk_client.assert_called_once()
+        kwargs = sdk_client.call_args.kwargs
+        self.assertEqual(kwargs["api_key"], "test-env-key")
+        self.assertIsInstance(kwargs["http_options"], types.HttpOptions)
+        self.assertEqual(kwargs["http_options"].timeout, 12_000)
+
     def test_comparison_prompt_status_is_valid_explanation_context(self):
         recommendation = ExplanationRecommendation(kind="compare_alternative_window", status="comparison_prompt")
         self.assertEqual(recommendation.status, "comparison_prompt")
 
-    def test_converse_receives_compact_calculated_context_and_returns_valid_structure(self):
+    def test_generate_content_receives_aggregate_context_and_returns_valid_structure(self):
         client = Mock()
-        client.converse.return_value = converse_response(json.dumps({
+        client.models.generate_content.return_value = generate_response(json.dumps({
             "headline": "Partial plan estimate",
             "explanation": "Some planned outdoor time has supported estimates; other periods remain unknown.",
-            "next_step": "Review missing periods before comparing your schedule.",
         }))
-        service = BedrockExplanationService(client=client, region="us-east-1", model_id="sample-model")
+        service = GeminiExplanationService(client=client, api_key="test-key", model="sample-model")
 
         result = service.explain(explanation_request())
 
-        self.assertEqual(result["provider"], "bedrock")
+        self.assertEqual(result["provider"], "gemini")
         self.assertEqual(result["status"], "generated")
-        call = client.converse.call_args.kwargs
-        self.assertEqual(call["modelId"], "sample-model")
-        self.assertEqual(call["inferenceConfig"]["maxTokens"], 220)
-        context = json.loads(call["messages"][0]["content"][0]["text"])
+        self.assertEqual(result["next_step"], "Review coverage and missing intervals before using the comparison.")
+        call = client.models.generate_content.call_args.kwargs
+        self.assertEqual(call["model"], "sample-model")
+        self.assertEqual(call["config"]["max_output_tokens"], 220)
+        context = json.loads(call["contents"])
         self.assertEqual(context["summary"]["coverage_fraction"], 0.75)
-        self.assertEqual(context["source"]["model"], "CAMS Global atmospheric composition forecast")
-        self.assertEqual(context["activities"][0]["flexibility"], "flexible")
-        self.assertEqual(context["activities"][0]["missing_hours"], 0.25)
-        self.assertEqual(context["excluded_activity_reasons"], ["mixed_ambient_concentration_not_estimated"])
+        self.assertEqual(context["source"]["provider"], "Open-Meteo Air Quality API")
+        self.assertEqual(context["recommendations"][0]["status"], "inconclusive")
+        self.assertEqual(context["excluded_reason_counts"], {"mixed_ambient_concentration_not_estimated": 1})
         serialized = json.dumps(context)
         self.assertNotIn("coordinates", serialized)
         self.assertNotIn("latitude", serialized)
         self.assertNotIn("location", serialized)
         self.assertNotIn("run-123", serialized)
+        self.assertNotIn("110.0", serialized)
+        self.assertNotIn("17:00", serialized)
+        self.assertNotIn("concentration_time_index", serialized)
 
-    def test_unconfigured_bedrock_uses_fallback_without_creating_sdk_client(self):
+    def test_unconfigured_gemini_uses_fallback_without_creating_sdk_client(self):
         client = Mock()
-        with patch.dict(os.environ, {"AWS_REGION": "", "AWS_DEFAULT_REGION": "", "BEDROCK_MODEL_ID": ""}):
-            result = BedrockExplanationService(client=client).explain(explanation_request())
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GEMINI_MODEL": ""}):
+            with self.assertLogs("app.services.gemini", level="WARNING") as captured:
+                result = GeminiExplanationService(client=client).explain(explanation_request())
         self.assertEqual(result["provider"], "deterministic_fallback")
         self.assertEqual(result["status"], "fallback")
-        client.converse.assert_not_called()
+        self.assertIn("GEMINI_API_KEY is not configured", captured.output[0])
+        client.models.generate_content.assert_not_called()
 
-    def test_bedrock_exception_and_malformed_response_use_fallback(self):
-        for reply in [RuntimeError("offline"), {"output": {"message": {"content": []}}}, converse_response("not json")]:
+    def test_no_deterministic_recommendation_uses_fallback(self):
+        client = Mock()
+        request = explanation_request()
+        request.analysis.recommendations = []
+        result = GeminiExplanationService(client=client, api_key="test-key").explain(request)
+        self.assertEqual(result["provider"], "deterministic_fallback")
+        client.models.generate_content.assert_not_called()
+
+    def test_gemini_exception_and_malformed_response_use_fallback(self):
+        for reply in [RuntimeError("offline"), SimpleNamespace(text=None), generate_response("not json")]:
             client = Mock()
             if isinstance(reply, Exception):
-                client.converse.side_effect = reply
+                client.models.generate_content.side_effect = reply
             else:
-                client.converse.return_value = reply
-            result = BedrockExplanationService(client=client, region="us-east-1", model_id="sample-model").explain(explanation_request())
+                client.models.generate_content.return_value = reply
+            result = GeminiExplanationService(client=client, api_key="test-key", model="sample-model").explain(explanation_request())
             self.assertEqual(result["provider"], "deterministic_fallback")
             self.assertEqual(result["status"], "fallback")
 
     def test_numeric_or_unsupported_model_text_is_rejected(self):
         for explanation in ["The estimate is 110 for this period.", "The model identified two periods.", "This option is cleaner and safer for your health.", "This option has a lower result.", "This option is less polluted.", "This will protect your lungs."]:
             client = Mock()
-            client.converse.return_value = converse_response(json.dumps({
+            client.models.generate_content.return_value = generate_response(json.dumps({
                 "headline": "Plan overview",
                 "explanation": explanation,
-                "next_step": "Review the available source details.",
             }))
-            result = BedrockExplanationService(client=client, region="us-east-1", model_id="sample-model").explain(explanation_request(scenario={"status": "inconclusive", "difference_ug_h_m3": 70}))
+            result = GeminiExplanationService(client=client, api_key="test-key", model="sample-model").explain(explanation_request(scenario={"status": "inconclusive", "difference_ug_h_m3": 70}))
             self.assertEqual(result["provider"], "deterministic_fallback")
 
     def test_pollutant_name_is_allowed_but_not_a_numeric_value(self):
         client = Mock()
-        client.converse.return_value = converse_response(json.dumps({
+        client.models.generate_content.return_value = generate_response(json.dumps({
             "headline": "Plan estimate summary",
             "explanation": "PM2.5 estimates cover some outdoor time; other periods remain unknown.",
-            "next_step": "Review source coverage before comparing your plan.",
         }))
-        result = BedrockExplanationService(client=client, region="us-east-1", model_id="sample-model").explain(explanation_request())
-        self.assertEqual(result["provider"], "bedrock")
+        result = GeminiExplanationService(client=client, api_key="test-key", model="sample-model").explain(explanation_request())
+        self.assertEqual(result["provider"], "gemini")
 
     def test_fastapi_explanation_route_accepts_typed_request_and_returns_stable_shape(self):
         client = Mock()
-        client.converse.return_value = converse_response(json.dumps({
+        client.models.generate_content.return_value = generate_response(json.dumps({
             "headline": "Plan estimate summary",
             "explanation": "Supported outdoor periods are summarized; missing periods remain unknown.",
-            "next_step": "Review the source coverage details.",
         }))
-        previous = api.bedrock_explanations
-        api.bedrock_explanations = BedrockExplanationService(client=client, region="us-east-1", model_id="sample-model")
+        previous = api.explanation_service
+        api.explanation_service = GeminiExplanationService(client=client, api_key="test-key", model="sample-model")
         try:
             async def post_explanation():
                 async with AsyncClient(transport=ASGITransport(app=api.app), base_url="http://test") as test_client:
@@ -144,43 +169,41 @@ class BedrockExplanationTests(unittest.TestCase):
 
             response = asyncio.run(post_explanation())
         finally:
-            api.bedrock_explanations = previous
+            api.explanation_service = previous
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        self.assertEqual(body["provider"], "bedrock")
+        self.assertEqual(body["provider"], "gemini")
         self.assertEqual(body["status"], "generated")
         self.assertEqual(set(body), {"headline", "explanation", "next_step", "scenario_explanation", "scenario_status", "provider", "status"})
 
     def test_inconclusive_scenario_uses_fixed_noncomparative_message(self):
         client = Mock()
-        client.converse.return_value = converse_response(json.dumps({
+        client.models.generate_content.return_value = generate_response(json.dumps({
             "headline": "Scenario estimate",
             "explanation": "The calculation summarizes supported outdoor periods and leaves missing periods unknown.",
-            "next_step": "Review the source and coverage details.",
         }))
         scenario = {"status": "inconclusive", "difference_ug_h_m3": 70}
-        result = BedrockExplanationService(client=client, region="us-east-1", model_id="sample-model").explain(explanation_request(scenario=scenario))
+        result = GeminiExplanationService(client=client, api_key="test-key", model="sample-model").explain(explanation_request(scenario=scenario))
         self.assertEqual(result["scenario_status"], "inconclusive")
         self.assertEqual(result["scenario_explanation"], "The available data cannot establish a meaningful difference between these options.")
-        prompt = json.loads(client.converse.call_args.kwargs["messages"][0]["content"][0]["text"])
-        self.assertEqual(prompt["scenario"]["status"], "inconclusive")
+        prompt = json.loads(client.models.generate_content.call_args.kwargs["contents"])
+        self.assertEqual(prompt["scenario_status"], "inconclusive")
 
-    def test_illustrative_mode_never_calls_bedrock(self):
+    def test_illustrative_mode_never_calls_gemini(self):
         client = Mock()
-        result = BedrockExplanationService(client=client, region="us-east-1", model_id="sample-model").explain(explanation_request("illustrative"))
+        result = GeminiExplanationService(client=client, api_key="test-key", model="sample-model").explain(explanation_request("illustrative"))
         self.assertEqual(result["provider"], "deterministic_fallback")
-        client.converse.assert_not_called()
+        client.models.generate_content.assert_not_called()
 
 
     def test_fastapi_insights_route_alias_returns_identical_structure(self):
         client = Mock()
-        client.converse.return_value = converse_response(json.dumps({
+        client.models.generate_content.return_value = generate_response(json.dumps({
             "headline": "Plan estimate summary",
             "explanation": "Supported outdoor periods are summarized; missing periods remain unknown.",
-            "next_step": "Review the source coverage details.",
         }))
-        previous = api.bedrock_explanations
-        api.bedrock_explanations = BedrockExplanationService(client=client, region="us-east-1", model_id="sample-model")
+        previous = api.explanation_service
+        api.explanation_service = GeminiExplanationService(client=client, api_key="test-key", model="sample-model")
         try:
             async def post_insights():
                 async with AsyncClient(transport=ASGITransport(app=api.app), base_url="http://test") as test_client:
@@ -188,10 +211,10 @@ class BedrockExplanationTests(unittest.TestCase):
 
             response = asyncio.run(post_insights())
         finally:
-            api.bedrock_explanations = previous
+            api.explanation_service = previous
         self.assertEqual(response.status_code, 200)
         body = response.json()
-        self.assertEqual(body["provider"], "bedrock")
+        self.assertEqual(body["provider"], "gemini")
         self.assertEqual(body["status"], "generated")
 
     def test_fastapi_insights_route_rejects_invalid_payload_with_422(self):

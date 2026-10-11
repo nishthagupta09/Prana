@@ -7,7 +7,7 @@ type DataMode = 'live' | 'illustrative'
 type Environment = 'Outdoor' | 'Indoor' | 'Mixed' | 'Unknown'
 type Block = { id: string; title: string; start: string; end: string; location: string; environment: Environment; flexibility: 'Fixed' | 'Flexible' | 'Limited'; pm25: number | null }
 type Stored = { blocks: Block[]; page: Screen; feedback: string; followed: string; dataMode: DataMode; planDate: string; lastSeenLocalDate: string; plansByDate: Record<string, { blocks: Block[]; feedback: string; followed: string }>; needsDateReview: boolean }
-type Explanation = { headline: string; explanation: string; next_step: string; scenario_explanation: string | null; scenario_status: string | null; provider: 'bedrock' | 'deterministic_fallback'; status: 'generated' | 'fallback' }
+type Explanation = { headline: string; explanation: string; next_step: string; scenario_explanation: string | null; scenario_status: string | null; provider: 'gemini' | 'deterministic_fallback'; status: 'generated' | 'fallback' }
 const starterBlocks: Block[] = [
   { id: 'commute', title: 'Metro commute', start: '08:30', end: '09:30', location: 'To college', environment: 'Mixed', flexibility: 'Limited', pm25: 82 },
   { id: 'college', title: 'College & co-working', start: '10:00', end: '16:00', location: 'Central campus', environment: 'Indoor', flexibility: 'Fixed', pm25: null },
@@ -205,12 +205,12 @@ function Today({ blocks, planDate, projected, busy, analysis, explanation, expla
             <Sparkles size={14} style={{ color: 'var(--blue)' }}/>
             <span>SCHEDULE EXPLANATION</span>
           </div>
-          <span className={`badge ${explanation?.provider === 'bedrock' ? 'blue' : 'neutral'}`}>
-            {explanationBusy ? 'Generating…' : explanation?.provider === 'bedrock' ? 'Amazon Bedrock' : 'Deterministic Fallback'}
+          <span className={`badge ${explanation?.provider === 'gemini' ? 'blue' : 'neutral'}`}>
+            {explanationBusy ? 'Generating…' : explanation?.provider === 'gemini' ? 'Gemini' : 'Deterministic Fallback'}
           </span>
         </div>
         {explanationBusy ? (
-          <p className="muted" style={{ margin: 0 }}>Consulting Bedrock for contextual explanation…</p>
+          <p className="muted" style={{ margin: 0 }}>Generating a contextual explanation…</p>
         ) : explanation ? (
           <div>
             <h3 style={{ fontSize: '15px', fontWeight: 650, margin: '0 0 6px', color: 'var(--ink)' }}>{explanation.headline}</h3>

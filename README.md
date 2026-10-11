@@ -1,6 +1,6 @@
 # Prana
 
-Prana is an AI-assisted personal air-exposure planning prototype. It has a React/Vite frontend and one FastAPI backend. The backend integrates Open-Meteo Air Quality API PM2.5 series from the CAMS Global model and can use Amazon Bedrock to explain already-computed results. AWS deployment is not configured.
+Prana is an AI-assisted personal air-exposure planning prototype. It has a React/Vite frontend and one FastAPI backend. The backend integrates Open-Meteo Air Quality API PM2.5 series from the CAMS Global model and can use Gemini to explain already-computed results. AWS remains the deployment target; the backend reads Gemini credentials from its runtime environment.
 
 ## Local development
 
@@ -30,22 +30,22 @@ npm.cmd run dev
 
 The development frontend reads `VITE_API_URL` from `frontend/.env.development`, which targets `http://127.0.0.1:8010`. Copy `frontend/.env.example` to `frontend/.env.local` to override it; Vite loads `.env.local` with higher priority. Set `VITE_API_URL` in the frontend build environment when producing a build that should call a deployed API. This URL is public frontend configuration, so do not put provider credentials in Vite variables. The backend allows the Vite origins `localhost:5173` and `127.0.0.1:5173`.
 
-## Optional Bedrock explanations
+## Optional Gemini explanations
 
-Bedrock calls run only in the backend. When either model or region configuration is absent, illustrative data is in use, or the provider fails, the API returns a deterministic explanation instead. The frontend never receives AWS credentials.
+Gemini calls run only in the backend. When the API key is absent, illustrative data is in use, or the provider fails or returns invalid content, the API returns a deterministic explanation instead. The frontend never receives the Gemini key.
 
-Set backend process environment variables before starting FastAPI:
+Set the backend process environment variables before starting FastAPI. `GEMINI_MODEL` defaults to `gemini-3.8-flash` and can be changed without rebuilding the frontend:
 
 ```powershell
-$env:AWS_REGION = "your-bedrock-region"
-$env:BEDROCK_MODEL_ID = "your-converse-compatible-model-id"
+$env:GEMINI_API_KEY = "your-key-from-google-ai-studio"
+$env:GEMINI_MODEL = "gemini-3.8-flash"
 ```
 
-The AWS SDK uses its standard credential chain (for example, a local AWS profile or an assigned runtime role). Do not commit credentials. The caller needs `bedrock:InvokeModel` permission for the selected model, and some model providers require account access setup. On-demand calls are billed by the selected model and token usage. Plan edits and scenario comparisons can trigger explanation requests; illustrative mode does not call Bedrock. See the [Bedrock inference prerequisites](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-prereq.html), [model access requirements](https://docs.aws.amazon.com/bedrock/latest/userguide/model-access.html), and [current pricing](https://aws.amazon.com/bedrock/pricing/).
+Do not commit the key, put it in a `VITE_` variable, or send it to the browser. For AWS hosting, provide it to the backend runtime from a managed secret store or protected Lambda environment configuration. Gemini API usage may be subject to quotas and charges for the selected model.
 
-The explanation request contains calculated summary values, source/model metadata, activity times and categorical environment/flexibility constraints, plus missing-data and scenario statuses. It omits activity names, place labels, coordinates, and raw hourly history. Account-level Bedrock invocation logging settings may affect retention; review those settings before sending real user plans.
+The explanation request to Gemini contains aggregate plan coverage, source classification, deterministic recommendation status, aggregate missing-data reasons, and scenario status. It omits PM2.5 values, concentration-time indices, activity IDs/names/times, coordinates, personal identifiers, and raw hourly history.
 
-The model returns short text fields which FastAPI validates. Numeric claims and unsupported health/comparative language are rejected; inconclusive scenario language is set deterministically. Bedrock does not calculate or override numerical results.
+The model returns short structured text fields which FastAPI validates. Numeric claims and unsupported health/comparative language are rejected; inconclusive scenario language is set deterministically. Gemini does not calculate or override numerical results or scheduling recommendations. See Google's [Gemini model list](https://ai.google.dev/gemini-api/docs/models) and [Python SDK documentation](https://googleapis.github.io/python-genai/).
 
 ## Data behavior and limits
 
@@ -60,7 +60,7 @@ The model returns short text fields which FastAPI validates. Numeric claims and 
 
 ## Validation
 
-Run backend tests (Open-Meteo and Bedrock calls are mocked):
+Run backend tests (Open-Meteo and Gemini calls are mocked):
 
 ```powershell
 cd backend
@@ -87,6 +87,6 @@ npm.cmd run build
 - `frontend/src/styles.css`: responsive styling based on the approved Stitch `DESIGN.md` and screenshots.
 - `backend/app/main.py`: FastAPI schemas, deterministic calculations and API operations.
 - `backend/app/services/open_meteo.py`: bounded, cached CAMS Global PM2.5 adapter and response validation.
-- `backend/app/services/bedrock.py`: optional Bedrock explanation service, structured input/output validation and deterministic fallback.
+- `backend/app/services/gemini.py`: optional Gemini explanation service, structured input/output validation and deterministic fallback.
 - `backend/tests/`: API, deterministic calculation, failure handling and provider-adapter tests.
 - `docs/`: concept and architecture references. `stitch reference/` is design reference material and was not edited during this integration.

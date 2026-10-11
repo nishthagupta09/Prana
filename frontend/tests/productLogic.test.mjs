@@ -255,16 +255,16 @@ test('explanationRequestKey distinguishes dates, data modes, and plan blocks avo
   const keys = new Set([key1, key2, key3, key4])
   assert.equal(keys.size, 4, 'All explanation keys must be mutually distinct')
 
-  const bedrockExplanation = {
+  const geminiExplanation = {
     headline: 'Plan estimate summary',
     explanation: 'Supported outdoor periods are summarized.',
     next_step: 'Review the source details.',
-    provider: 'bedrock',
+    provider: 'gemini',
     status: 'generated',
   }
-  const cachedRecord = { requestKey: key1, result: bedrockExplanation }
+  const cachedRecord = { requestKey: key1, result: geminiExplanation }
 
-  assert.deepEqual(analysisForRequest(cachedRecord, key1), bedrockExplanation)
+  assert.deepEqual(analysisForRequest(cachedRecord, key1), geminiExplanation)
   assert.equal(analysisForRequest(cachedRecord, key2), null)
   assert.equal(analysisForRequest(cachedRecord, key3), null)
   assert.equal(analysisForRequest(cachedRecord, key4), null)

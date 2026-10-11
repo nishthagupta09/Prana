@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Activity, ArrowDownRight, ArrowRight, CalendarDays, Check, ChevronRight, CircleHelp, Clock3, CloudSun, Compass, Droplets, HeartPulse, Info, Leaf, MapPin, Plus, RefreshCw, SlidersHorizontal, Sparkles, Sun, Wind, X } from 'lucide-react'
-import { analysisForRequest, analysisRequestKey, classifyApiFailure, comparableScenarioDifference, derivePlanFinding, loadStoredState, localDate, selectPlanDate, stateForStorage } from './productLogic.mjs'
+import { analysisForRequest, analysisRequestKey, applyScenarioToState, calculateShiftedWindow, classifyApiFailure, comparableScenarioDifference, comparisonRequestKey, defaultScenarioSelection, derivePlanFinding, explanationRequestKey, loadStoredState, localDate, selectPlanDate, stateForStorage, timeGreeting } from './productLogic.mjs'
 
 type Screen = 'Today' | 'Simulator' | 'Impact' | 'Insights'
 type DataMode = 'live' | 'illustrative'
@@ -42,17 +42,25 @@ function explanationPayload(analysis: any, blocks: Block[], scenario?: any) {
 
 function App() {
   const [state, setState] = useState<Stored>(load)
-  const [scenario, setScenario] = useState<'earlier' | 'indoor'>('earlier')
+  const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null)
+  const [scenario, setScenario] = useState<'earlier' | 'indoor'>(defaultScenarioSelection)
   const [confirm, setConfirm] = useState(false)
+  const [applyError, setApplyError] = useState('')
   const [editor, setEditor] = useState<Block | null | 'new'>(null)
   const [analysisRecord, setAnalysisRecord] = useState<{ requestKey: string; result: any } | null>(null)
   const [requestState, setRequestState] = useState<{ requestKey: string; busy: boolean; error: string }>({ requestKey: '', busy: true, error: '' })
-  const [explanation, setExplanation] = useState<Explanation | null>(null)
+  const [explanationRecord, setExplanationRecord] = useState<{ requestKey: string; result: Explanation } | null>(null)
+  const [explanationState, setExplanationState] = useState<{ requestKey: string; busy: boolean; error: string }>({ requestKey: '', busy: false, error: '' })
   const [notice, setNotice] = useState(state.needsDateReview ? 'This plan was saved before Prana stored plan dates. It has been assigned to the current local date; select another date if needed.' : '')
   const requestKey = useMemo(() => analysisRequestKey(state.planDate, state.blocks, state.dataMode), [state.planDate, state.blocks, state.dataMode])
   const busy = requestState.requestKey !== requestKey || requestState.busy
   const analysis = analysisForRequest(analysisRecord, requestKey, busy)
   const apiError = requestState.requestKey === requestKey ? requestState.error : ''
+
+  const expKey = useMemo(() => explanationRequestKey(state.planDate, state.dataMode, state.blocks), [state.planDate, state.dataMode, state.blocks])
+  const explanationBusy = explanationState.requestKey === expKey && explanationState.busy
+  const explanationError = explanationState.requestKey === expKey ? explanationState.error : ''
+  const explanation = analysisForRequest(explanationRecord, expKey, explanationBusy)
   useEffect(() => { localStorage.setItem('prana:v1', JSON.stringify(stateForStorage(state))) }, [state])
   useEffect(() => {
     if (!API) {
@@ -80,15 +88,41 @@ function App() {
     return () => abort.abort()
   }, [requestKey, state.blocks, state.dataMode, state.planDate])
   useEffect(() => {
-    if (!API || !analysis) { setExplanation(null); return }
+    if (!API || !analysis) {
+      setExplanationRecord(null)
+      setExplanationState({ requestKey: expKey, busy: false, error: '' })
+      return
+    }
     const abort = new AbortController()
-    setExplanation(null)
-    fetch(`${API}/api/explanations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(explanationPayload(analysis, state.blocks)), signal: abort.signal })
+    setExplanationState({ requestKey: expKey, busy: true, error: '' })
+    fetch(`${API}/api/insights`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(explanationPayload(analysis, state.blocks)),
+      signal: abort.signal,
+    })
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`Explanation request failed (${r.status})`)))
-      .then(result => setExplanation(result))
-      .catch(() => { if (!abort.signal.aborted) setExplanation({ headline: 'Plan summary', explanation: 'Prana calculated this result from the source and coverage information shown here.', next_step: 'Review the source details before comparing options.', scenario_explanation: null, scenario_status: null, provider: 'deterministic_fallback', status: 'fallback' }) })
+      .then(result => {
+        if (abort.signal.aborted) return
+        setExplanationRecord({ requestKey: expKey, result })
+        setExplanationState({ requestKey: expKey, busy: false, error: '' })
+      })
+      .catch(err => {
+        if (abort.signal.aborted) return
+        const fallbackExp: Explanation = {
+          headline: 'Plan summary',
+          explanation: 'Prana calculated this result from the source and coverage information shown here.',
+          next_step: 'Review the source details before comparing options.',
+          scenario_explanation: null,
+          scenario_status: null,
+          provider: 'deterministic_fallback',
+          status: 'fallback',
+        }
+        setExplanationRecord({ requestKey: expKey, result: fallbackExp })
+        setExplanationState({ requestKey: expKey, busy: false, error: classifyApiFailure(err) ?? '' })
+      })
     return () => abort.abort()
-  }, [analysis, state.blocks])
+  }, [analysis, expKey, state.blocks])
   const projected = useMemo(() => analysis?.summary?.concentration_time_index ?? null, [analysis])
   const update = (patch: Partial<Stored>) => setState(current => {
     const next = { ...current, ...patch }
@@ -96,19 +130,52 @@ function App() {
   })
   const changePlanDate = (date: string) => setState(current => ({ ...selectPlanDate(current, date), needsDateReview: false }))
   const updateBlock = (item: Block) => { const conflict = state.blocks.find(b => b.id !== item.id && item.start < b.end && b.start < item.end); if (conflict) { setNotice(`This activity overlaps “${conflict.title}”. Adjust the time before saving.`); return } const exists = state.blocks.some(b => b.id === item.id); update({ blocks: exists ? state.blocks.map(b => b.id === item.id ? item : b) : [...state.blocks, item].sort((a, b) => a.start.localeCompare(b.start)) }); setEditor(null); setNotice('Plan updated. Estimates for the affected blocks are being refreshed.') }
-  const applyScenario = () => { const run = state.blocks.find(b => b.id === 'run'); if (!run) return; updateBlock({ ...run, start: scenario === 'earlier' ? '16:00' : run.start, end: scenario === 'earlier' ? '17:00' : run.end, title: scenario === 'indoor' ? 'Indoor treadmill' : run.title, location: scenario === 'indoor' ? 'Indoor alternative' : run.location, environment: scenario === 'indoor' ? 'Indoor' : 'Outdoor', pm25: state.dataMode === 'illustrative' && scenario === 'earlier' ? 110 : null }); setConfirm(false); update({ page: 'Today' }) }
+
+  const eligibleBlocks = useMemo(() => state.blocks.filter(b => b.environment === 'Outdoor' && b.flexibility !== 'Fixed'), [state.blocks])
+  const activeBlockId = (selectedBlockId && eligibleBlocks.some(b => b.id === selectedBlockId))
+    ? selectedBlockId
+    : (analysis?.recommendations?.[0]?.block_id && eligibleBlocks.some(b => b.id === analysis.recommendations[0].block_id))
+      ? analysis.recommendations[0].block_id
+      : eligibleBlocks[0]?.id ?? null
+  const targetBlock = state.blocks.find(b => b.id === activeBlockId) ?? null
+
+  const applyScenario = () => {
+    if (!targetBlock) {
+      setApplyError('No target activity selected for simulation.')
+      return
+    }
+    const shifted = calculateShiftedWindow(targetBlock.start, targetBlock.end)
+    const scenarioUpdates = scenario === 'earlier'
+      ? { start: shifted.start, end: shifted.end }
+      : {
+          title: `${targetBlock.title} (Indoor)`,
+          location: 'Indoor alternative',
+          environment: 'Indoor' as Environment,
+          pm25: null,
+        }
+    const result = applyScenarioToState(state, targetBlock.id, scenarioUpdates)
+    if (!result.success) {
+      setApplyError(result.error ?? 'Schedule conflict detected. Adjust the time before applying.')
+      return
+    }
+    setApplyError('')
+    setConfirm(false)
+    setState(result.state)
+    setNotice('Day plan updated. Fresh analysis is being calculated.')
+  }
+
   return <div className={`app-shell ${state.dataMode === 'live' ? 'live-mode' : ''}`}>
     <header className="topbar"><a className="brand" onClick={() => update({ page: 'Today' })}><span className="brand-mark"><Droplets size={20}/></span><span><b>Prana</b><small><MapPin size={12}/> New Delhi</small></span></a><div className="header-tools"><label className="plan-date-control"><CalendarDays size={15}/><span>Plan date</span><input aria-label="Plan date" type="date" value={state.planDate} onChange={e => { if (e.target.value) changePlanDate(e.target.value) }}/></label><label className="mode-select-label"><span>DATA</span><select aria-label="Environmental data mode" value={state.dataMode} onChange={e => update({ dataMode: e.target.value as DataMode })}><option value="live">Open-Meteo modeled</option><option value="illustrative">Illustrative demo</option></select></label></div></header>
     <div className="workspace"><aside className="side-nav"><div className="nav-label">YOUR DAY</div>{nav.map(({name, icon: Icon}) => <button key={name} className={`nav-item ${state.page === name ? 'active' : ''}`} onClick={() => update({ page: name })}><Icon size={19}/>{name}{state.page === name && <span className="nav-dot"/>}</button>)}<div className="sidebar-note"><CloudSun size={18}/><b>Air quality context</b><span>{state.dataMode === 'live' ? 'Modeled regional estimates; not station measurements.' : 'Sample values are for interface demonstration only.'}</span></div></aside>
     <main className="main-content"><div className="mobile-kicker"><MapPin size={13}/> NEW DELHI <span>•</span> {state.dataMode === 'live' ? (analysis?.provenance?.data_classification?.replaceAll('_', ' ').toUpperCase() ?? 'MODELED AIR DATA') : 'ILLUSTRATIVE DEMO'}</div>{notice && <div className="notice"><Check size={16}/>{notice}<button onClick={() => { setNotice(''); if (state.needsDateReview) update({ needsDateReview: false }) }} aria-label="Dismiss notice"><X size={15}/></button></div>}{apiError && <div className="api-warning" role="status"><Info size={15}/>{apiError}</div>}{analysis?.status === 'unavailable' && <div className="api-warning" role="status"><Info size={15}/><span>Live estimates unavailable ({analysis.provenance?.error_code ?? 'provider_error'}). {analysis.provenance?.message ?? 'No provider estimates are available for this date.'} No illustrative values were substituted.</span></div>}
-      {state.page === 'Today' && <Today blocks={state.blocks} planDate={state.planDate} projected={projected} busy={busy} analysis={analysis} explanation={explanation} dataMode={state.dataMode} onEdit={setEditor} onNavigate={page => update({ page })}/>}
-      {state.page === 'Simulator' && <Simulator blocks={state.blocks} planDate={state.planDate} scenario={scenario} setScenario={setScenario} dataMode={state.dataMode} onApply={() => setConfirm(true)} onReject={() => { update({ page: 'Today' }); setNotice('Scenario rejected. Your existing day plan is unchanged.') }}/>} 
+      {state.page === 'Today' && <Today blocks={state.blocks} planDate={state.planDate} projected={projected} busy={busy} analysis={analysis} explanation={explanation} explanationBusy={explanationBusy} explanationError={explanationError} dataMode={state.dataMode} onEdit={setEditor} onNavigate={(page, blockId) => { if (blockId) setSelectedBlockId(blockId); update({ page }) }}/>}
+      {state.page === 'Simulator' && <Simulator blocks={state.blocks} eligibleBlocks={eligibleBlocks} targetBlock={targetBlock} onSelectBlockId={setSelectedBlockId} planDate={state.planDate} scenario={scenario} setScenario={setScenario} dataMode={state.dataMode} onApply={() => { setApplyError(''); setConfirm(true) }} onReject={() => { update({ page: 'Today' }); setNotice('Scenario rejected. Your existing day plan is unchanged.') }}/>} 
       {state.page === 'Impact' && <Impact state={state} update={update} projected={projected} blocks={state.blocks} planDate={state.planDate} dataMode={state.dataMode}/>}
       {state.page === 'Insights' && <Insights blocks={state.blocks} planDate={state.planDate} analysis={analysis} explanation={explanation} dataMode={state.dataMode} busy={busy} error={apiError} onNavigate={page => update({ page })}/>}
     </main></div>
     <nav className="mobile-nav">{nav.map(({name, icon: Icon}) => <button key={name} className={state.page === name ? 'selected' : ''} onClick={() => update({ page: name })}><Icon size={20}/><span>{name}</span></button>)}</nav>
     {editor && <ActivityEditor block={editor === 'new' ? null : editor} existing={state.blocks} onClose={() => setEditor(null)} onSave={updateBlock} onDelete={id => { update({ blocks: state.blocks.filter(b => b.id !== id) }); setEditor(null) }}/>} 
-    {confirm && <div className="modal-backdrop" role="presentation"><section className="dialog" role="dialog" aria-modal="true"><span className="dialog-icon"><CalendarDays size={21}/></span><h2>Apply this scenario?</h2><p>This will update your actual day plan. You can still edit the activity afterward.</p><div className="dialog-actions"><button className="button secondary" onClick={() => setConfirm(false)}>Keep original</button><button className="button primary" onClick={applyScenario}>Apply to day plan</button></div></section></div>}
+    {confirm && <div className="modal-backdrop" role="presentation"><section className="dialog" role="dialog" aria-modal="true"><span className="dialog-icon"><CalendarDays size={21}/></span><h2>Apply this scenario?</h2><p>This will update your actual day plan for {dateLabel(state.planDate)}. Unrelated activities will be preserved in chronological order.</p>{applyError && <p className="form-error" role="alert">{applyError}</p>}<div className="dialog-actions"><button className="button secondary" onClick={() => { setConfirm(false); setApplyError('') }}>Keep original</button><button className="button primary" onClick={applyScenario}>Apply to day plan</button></div></section></div>}
   </div>
 }
 
@@ -118,38 +185,119 @@ function dateLabel(date: string) { return new Intl.DateTimeFormat(undefined, { d
 function titleBlock(title: string, sub: string, icon: typeof Wind = Wind) { const Icon = icon; return <div className="section-heading"><div><div className="eyebrow">{title}</div><h2>{sub}</h2></div><Icon size={19} className="heading-icon"/></div> }
 function Disclosure({children}: {children: React.ReactNode}) { return <div className="disclosure"><Info size={15}/><span>{children}</span></div> }
 
-function Today({ blocks, planDate, projected, busy, analysis, explanation, dataMode, onEdit, onNavigate }: { blocks: Block[]; planDate: string; projected: number | null; busy: boolean; analysis: any; explanation: Explanation | null; dataMode: DataMode; onEdit: (b: Block | 'new') => void; onNavigate: (p: Screen) => void }) {
+function Today({ blocks, planDate, projected, busy, analysis, explanation, explanationBusy, explanationError, dataMode, onEdit, onNavigate }: { blocks: Block[]; planDate: string; projected: number | null; busy: boolean; analysis: any; explanation: Explanation | null; explanationBusy: boolean; explanationError: string; dataMode: DataMode; onEdit: (b: Block | 'new') => void; onNavigate: (p: Screen, blockId?: string) => void }) {
+  const greeting = timeGreeting()
   const rec = analysis?.recommendations?.[0]
   const recBlock = blocks.find(b => b.id === rec?.block_id)
   const firstResult = analysis?.blocks?.[0]
   const firstBlock = blocks.find(block => block.id === firstResult?.block_id)
-  return <><div className="page-intro"><div className="eyebrow">PLAN FOR {dateLabel(planDate).toUpperCase()} <span className="live-dot"/> <span className={`sample-inline ${dataMode === 'live' ? 'live-label' : ''}`}>{dataMode === 'live' ? 'OPEN-METEO CAMS GLOBAL' : 'ILLUSTRATIVE DEMO'}</span></div><h1>Your day plan</h1><p>Review your schedule and the environmental estimates available for it.</p></div>
+  return <><div className="page-intro"><div className="eyebrow">PLAN FOR {dateLabel(planDate).toUpperCase()} <span className="live-dot"/> <span className={`sample-inline ${dataMode === 'live' ? 'live-label' : ''}`}>{dataMode === 'live' ? 'OPEN-METEO CAMS GLOBAL' : 'ILLUSTRATIVE DEMO'}</span></div><h1>{greeting}</h1><p>Review your schedule for {dateLabel(planDate)} and the environmental estimates available for it.</p></div>
     <section className="air-summary card"><div className="air-icon"><Wind size={20}/></div><div className="air-main"><b>{firstBlock ? `${firstBlock.title} · ${clock(firstBlock.start)}–${clock(firstBlock.end)}` : 'No supported outdoor block'}</b><span>{firstResult ? `Mean PM2.5 concentration across ${Number(firstResult.estimated_hours).toFixed(1)} supported hour(s) · ${dataMode === 'live' ? 'modeled city-center estimate' : 'illustrative value'}` : 'No outdoor block estimate is available for this plan.'}</span></div><div className="air-reading"><strong>{firstResult?.mean_pm25_ug_m3 == null ? '—' : Number(firstResult.mean_pm25_ug_m3).toFixed(1)}</strong><span>µg/m³</span></div><span className={`badge ${dataMode === 'live' ? 'blue' : 'amber'}`}>{dataMode === 'live' ? 'Modeled' : 'Sample'}</span></section>
-    {rec && <section className="recommendation"><div className="rec-symbol"><Clock3 size={21}/></div><div className="rec-body"><div className="eyebrow">{dataMode === 'live' ? 'OPTIONAL SCHEDULE COMPARISON' : 'ILLUSTRATIVE COMPARISON'}</div><h2>{dataMode === 'live' ? `Compare times for ${recBlock?.title ?? 'a flexible outdoor activity'}` : `Explore an example time comparison for ${recBlock?.title ?? 'this activity'}`}</h2><p>{rec.reason}</p><button className="button primary" onClick={() => onNavigate('Simulator')}>Explore in Simulator <ArrowRight size={17}/></button></div></section>}
+    {rec && <section className="recommendation"><div className="rec-symbol"><Clock3 size={21}/></div><div className="rec-body"><div className="eyebrow">{dataMode === 'live' ? 'OPTIONAL SCHEDULE COMPARISON' : 'ILLUSTRATIVE COMPARISON'}</div><h2>{dataMode === 'live' ? `Compare times for ${recBlock?.title ?? 'a flexible outdoor activity'}` : `Explore an example time comparison for ${recBlock?.title ?? 'this activity'}`}</h2><p>{rec.reason}</p><button className="button primary" onClick={() => onNavigate('Simulator', rec.block_id)}>Explore in Simulator <ArrowRight size={17}/></button></div></section>}
     <div className="section-title-row"><div><div className="eyebrow">YOUR PLAN <span className="count-pill">{blocks.length} activities</span></div><h2>Schedule for {dateLabel(planDate)}</h2></div><button className="button secondary compact" onClick={() => onEdit('new')}><Plus size={16}/> Add activity</button></div>
     <section className="timeline card">{blocks.map((b, i) => { const value = estimateFor(b, analysis, dataMode); return <article className="activity-row" key={b.id}><div className={`timeline-dot dot-${b.environment.toLowerCase()}`}/><div className="activity-time">{clock(b.start)} – {clock(b.end)}</div><div className="activity-details"><div><h3>{b.title}</h3><span className="activity-place">{b.location} · {b.environment}</span></div><span className={`badge ${b.environment === 'Outdoor' ? 'amber' : 'neutral'}`}>{b.flexibility}</span></div>{value != null ? <div className="block-value"><b>{Number(value).toFixed(0)}</b><span>µg/m³{dataMode === 'illustrative' ? '*' : ''}</span></div> : <div className="block-value unknown">{b.environment !== 'Outdoor' ? 'Not estimated' : busy ? 'Updating…' : 'Unavailable'}</div>}<button className="row-edit" onClick={() => onEdit(b)} aria-label={`Edit ${b.title}`}>Edit</button>{i < blocks.length - 1 && <div className="timeline-line"/>}</article> })}</section>
     <section className="summary-row"><div className="summary-card"><div className="eyebrow">WHOLE-PLAN AMBIENT CONCENTRATION-TIME INDEX</div><div className="summary-value">{projected == null ? '—' : Math.round(projected)} <small>µg·h/m³</small></div><span>{busy ? 'Refreshing analysis…' : analysis?.summary?.coverage_fraction != null ? `${Math.round(analysis.summary.coverage_fraction * 100)}% outdoor interval coverage` : 'No estimate available'}</span></div><div className="optimal-card"><span className="round-icon"><Leaf size={18}/></span><div><b>Compare a flexible activity</b><p>See whether the source has estimates for another time window. A modeled difference is not a personal exposure result.</p></div><ChevronRight size={18}/></div></section>
+
+    {(explanation || explanationBusy || explanationError) && (
+      <section className="card" style={{ padding: '20px 22px', margin: '18px 0', border: '1px solid var(--line)', background: '#fff' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '10px' }}>
+          <div className="eyebrow" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <Sparkles size={14} style={{ color: 'var(--blue)' }}/>
+            <span>SCHEDULE EXPLANATION</span>
+          </div>
+          <span className={`badge ${explanation?.provider === 'bedrock' ? 'blue' : 'neutral'}`}>
+            {explanationBusy ? 'Generating…' : explanation?.provider === 'bedrock' ? 'Amazon Bedrock' : 'Deterministic Fallback'}
+          </span>
+        </div>
+        {explanationBusy ? (
+          <p className="muted" style={{ margin: 0 }}>Consulting Bedrock for contextual explanation…</p>
+        ) : explanation ? (
+          <div>
+            <h3 style={{ fontSize: '15px', fontWeight: 650, margin: '0 0 6px', color: 'var(--ink)' }}>{explanation.headline}</h3>
+            <p style={{ fontSize: '13px', color: 'var(--muted)', margin: '0 0 8px', lineHeight: 1.6 }}>{explanation.explanation}</p>
+            <p style={{ fontSize: '12px', color: '#4a627a', margin: 0, fontWeight: 500 }}>
+              <b>Next step:</b> {explanation.next_step}
+            </p>
+          </div>
+        ) : (
+          <p className="muted" style={{ margin: 0 }}>{explanationError || 'Explanation service unavailable.'}</p>
+        )}
+      </section>
+    )}
+
     <Disclosure>{explanation ? `${explanation.headline}. ${explanation.explanation} ${explanation.next_step} ` : ''}{dataMode === 'live' ? `${analysis?.provenance?.model ?? 'CAMS Global modeled forecast'} · approx. 45 km native grid and 3-hourly resolution. Not a station observation. Indoor and missing intervals are excluded.` : 'Illustrative sample values, not live Delhi observations. Demo mode uses fixture data only.'} Ambient concentration-time index is not personal inhaled dose.</Disclosure>
   </>
 }
 
-function Simulator({ blocks, planDate, scenario, setScenario, dataMode, onApply, onReject }: { blocks: Block[]; planDate: string; scenario: 'earlier' | 'indoor'; setScenario: (v: 'earlier' | 'indoor') => void; dataMode: DataMode; onApply: () => void; onReject: () => void }) {
+function Simulator({
+  blocks,
+  eligibleBlocks,
+  targetBlock,
+  onSelectBlockId,
+  planDate,
+  scenario,
+  setScenario,
+  dataMode,
+  onApply,
+  onReject,
+}: {
+  blocks: Block[];
+  eligibleBlocks: Block[];
+  targetBlock: Block | null;
+  onSelectBlockId: (id: string) => void;
+  planDate: string;
+  scenario: 'earlier' | 'indoor';
+  setScenario: (v: 'earlier' | 'indoor') => void;
+  dataMode: DataMode;
+  onApply: () => void;
+  onReject: () => void;
+}) {
   const [comparisonRecord, setComparisonRecord] = useState<{ requestKey: string; result: any } | null>(null)
   const [comparisonErrorRecord, setComparisonErrorRecord] = useState<{ requestKey: string; error: string; busy: boolean }>({ requestKey: '', error: '', busy: true })
   const [scenarioExplanation, setScenarioExplanation] = useState<Explanation | null>(null)
-  const run = blocks.find(b => b.id === 'run')
-  const comparisonKey = useMemo(() => JSON.stringify([planDate, dataMode, scenario, blocks]), [planDate, dataMode, scenario, blocks])
+
+  const shifted = targetBlock
+    ? calculateShiftedWindow(targetBlock.start, targetBlock.end)
+    : { start: '16:00', end: '17:00' }
+
+  const comparisonKey = useMemo(
+    () => comparisonRequestKey(planDate, dataMode, scenario, targetBlock?.id, shifted, blocks),
+    [planDate, dataMode, scenario, targetBlock?.id, shifted, blocks]
+  )
   const comparisonPending = comparisonErrorRecord.requestKey !== comparisonKey || comparisonErrorRecord.busy
   const comparison = analysisForRequest(comparisonRecord, comparisonKey, comparisonPending)
   const comparisonError = comparisonErrorRecord.requestKey === comparisonKey ? comparisonErrorRecord.error : ''
+
   useEffect(() => {
-    if (!API || !run) { setComparisonRecord(null); setComparisonErrorRecord({ requestKey: comparisonKey, error: '', busy: false }); return }
+    if (!API || !targetBlock) {
+      setComparisonRecord(null)
+      setComparisonErrorRecord({ requestKey: comparisonKey, error: '', busy: false })
+      return
+    }
     const abort = new AbortController()
     setComparisonRecord(null)
     setComparisonErrorRecord({ requestKey: comparisonKey, error: '', busy: true })
-    const alternative = { ...run, start: scenario === 'earlier' ? '16:00' : run.start, end: scenario === 'earlier' ? '17:00' : run.end, environment: scenario === 'indoor' ? 'indoor' : 'outdoor', pm25: dataMode === 'illustrative' && scenario !== 'indoor' ? 110 : null }
+
+    const alternative: Block = {
+      ...targetBlock,
+      start: scenario === 'earlier' ? shifted.start : targetBlock.start,
+      end: scenario === 'earlier' ? shifted.end : targetBlock.end,
+      title: scenario === 'indoor' ? `${targetBlock.title} (Indoor)` : targetBlock.title,
+      location: scenario === 'indoor' ? 'Indoor alternative' : targetBlock.location,
+      environment: scenario === 'indoor' ? 'Indoor' : 'Outdoor',
+      pm25: dataMode === 'illustrative' && scenario === 'earlier' ? targetBlock.pm25 : null,
+    }
+
     const plan = (items: Block[]) => analysisPayload(items, dataMode, planDate)
-    fetch(`${API}/api/scenarios/compare`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ baseline: plan(blocks), alternatives: [plan(blocks.map(b => b.id === run.id ? alternative : b))] }), signal: abort.signal })
+    fetch(`${API}/api/scenarios/compare`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        baseline: plan(blocks),
+        alternatives: [plan(blocks.map(b => b.id === targetBlock.id ? alternative : b))],
+      }),
+      signal: abort.signal,
+    })
       .then(async response => {
         if (!response.ok) throw Object.assign(new Error('Scenario comparison failed'), { status: response.status })
         return response.json()
@@ -159,31 +307,198 @@ function Simulator({ blocks, planDate, scenario, setScenario, dataMode, onApply,
         setComparisonRecord({ requestKey: comparisonKey, result })
         setComparisonErrorRecord({ requestKey: comparisonKey, error: '', busy: false })
       })
-      .catch(error => { if (!abort.signal.aborted) setComparisonErrorRecord({ requestKey: comparisonKey, error: classifyApiFailure(error) ?? '', busy: false }) })
+      .catch(error => {
+        if (!abort.signal.aborted) {
+          setComparisonErrorRecord({ requestKey: comparisonKey, error: classifyApiFailure(error) ?? '', busy: false })
+        }
+      })
     return () => abort.abort()
-  }, [blocks, run, scenario, dataMode, planDate, comparisonKey])
+  }, [blocks, targetBlock, scenario, dataMode, planDate, comparisonKey, shifted.start, shifted.end])
+
   useEffect(() => {
     const scenarioResult = comparison?.alternatives?.[0]
-    if (!API || !comparison?.baseline || !scenarioResult) { setScenarioExplanation(null); return }
+    if (!API || !comparison?.baseline || !scenarioResult) {
+      setScenarioExplanation(null)
+      return
+    }
     const abort = new AbortController()
-    fetch(`${API}/api/explanations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(explanationPayload(comparison.baseline, blocks, scenarioResult)), signal: abort.signal })
+    fetch(`${API}/api/insights`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(explanationPayload(comparison.baseline, blocks, scenarioResult)),
+      signal: abort.signal,
+    })
       .then(r => r.ok ? r.json() : Promise.reject(new Error(`Scenario explanation failed (${r.status})`)))
       .then(result => setScenarioExplanation(result))
-      .catch(() => { if (!abort.signal.aborted) setScenarioExplanation(null) })
+      .catch(() => {
+        if (!abort.signal.aborted) setScenarioExplanation(null)
+      })
     return () => abort.abort()
   }, [comparison, blocks])
-  const baseline = dataMode === 'illustrative' ? run?.pm25 ?? null : comparison?.baseline?.blocks?.find((b: any) => b.block_id === run?.id)?.mean_pm25_ug_m3 ?? null
-  const proposed = scenario === 'indoor' ? null : dataMode === 'illustrative' ? 110 : comparison?.alternatives?.[0]?.result?.blocks?.find((b: any) => b.block_id === run?.id)?.mean_pm25_ug_m3 ?? null
+
+  const baseline = dataMode === 'illustrative'
+    ? targetBlock?.pm25 ?? null
+    : comparison?.baseline?.blocks?.find((b: any) => b.block_id === targetBlock?.id)?.mean_pm25_ug_m3 ?? null
+
+  const proposed = scenario === 'indoor'
+    ? null
+    : comparison?.alternatives?.[0]?.result?.blocks?.find((b: any) => b.block_id === targetBlock?.id)?.mean_pm25_ug_m3 ?? null
+
   const scenarioStatus = comparison?.alternatives?.[0]?.status
   const activityMeanDifference = comparableScenarioDifference(scenarioStatus, baseline, proposed)
-  return <><div className="page-intro"><div className="eyebrow"><span className="badge blue"><Compass size={13}/> WHAT-IF SIMULATOR</span></div><h1>Compare schedule changes</h1><p>Plan date: {dateLabel(planDate)}. Modeled differences remain inconclusive and do not establish personal exposure changes.</p></div>
-    {!run && <div className="api-warning" role="status">The current plan has no simulator activity. The simulator is available for the starter evening-run activity.</div>}
-    <section className="card scenario-card"><div className="scenario-top"><span className="round-icon"><Activity size={19}/></span><div><div className="eyebrow">MODIFYING ACTIVITY</div><h2>{run?.title ?? 'No supported activity selected'}</h2><span>{run?.location}</span></div></div><div className="eyebrow choice-label">SIMULATION OPTION</div><div className="choice-group"><button disabled={!run} className={`choice ${scenario === 'earlier' ? 'chosen' : ''}`} onClick={() => setScenario('earlier')}><Clock3 size={15}/> Shift window to 4:00 PM</button><button disabled={!run} className={`choice ${scenario === 'indoor' ? 'chosen' : ''}`} onClick={() => setScenario('indoor')}><Wind size={15}/> Indoor alternative</button></div></section>
-    <div className="compare-grid"><div className="compare-card baseline"><span className="eyebrow">CURRENT ACTIVITY · MEAN PM2.5</span><span className="badge amber">Baseline</span><h3>{run ? clock(run.start) : '—'}</h3><strong>{baseline == null ? '—' : Number(baseline).toFixed(1)} <small>{baseline == null ? 'not estimated' : `µg/m³${dataMode === 'illustrative' ? '*' : ''}`}</small></strong><p>{dataMode === 'live' ? 'Modeled activity mean concentration.' : 'Illustrative activity mean concentration.'}</p></div><div className="compare-card proposed"><span className="eyebrow">PROPOSED ACTIVITY · MEAN PM2.5</span><span className="badge green">Scenario</span><h3>{scenario === 'earlier' ? '4:00 PM' : 'Indoor option'}</h3><strong>{proposed == null ? '—' : Number(proposed).toFixed(1)} <small>{proposed == null ? 'not estimated' : `µg/m³${dataMode === 'illustrative' ? '*' : ''}`}</small></strong><p>{proposed == null ? 'No indoor air-quality estimate is available.' : dataMode === 'live' ? 'Modeled activity mean concentration.' : 'Illustrative value only; not a live observation.'}</p></div></div>
-    <section className="card comparison"><div className="section-heading"><div><div className="eyebrow">ACTIVITY CONCENTRATION COMPARISON</div><h2>{scenario === 'indoor' ? 'Indoor data unavailable' : 'Mean PM2.5 by activity time'}</h2></div><ArrowDownRight className="heading-icon"/></div>{scenario === 'earlier' && activityMeanDifference != null ? <><div className="bar-compare"><div><span>Current mean · {Number(baseline).toFixed(1)} µg/m³</span><div className="bar-track"><i style={{width:'100%'}}/></div></div><div><span>Proposed mean · {Number(proposed).toFixed(1)} µg/m³</span><div className="bar-track alt"><i style={{width:`${Math.round((baseline ? Number(proposed) / Number(baseline) * 100 : 0))}%`}}/></div></div></div><p className="muted">Difference between these activity mean concentrations: {activityMeanDifference.toFixed(1)} µg/m³. The API marks this live comparison inconclusive; it is not an exposure or health result.</p></> : <p className="muted">{comparisonError || (scenario === 'indoor' ? 'No indoor measurement or validated model is available. No numerical comparison is shown.' : comparison ? `No numerical difference is shown for API status “${scenarioStatus ?? 'unknown'}”; supported intervals are not comparable.` : 'Waiting for comparable API results. No numerical difference is shown while the request is pending.')}</p>}</section>
-    <Disclosure>{dataMode === 'live' ? `CAMS Global modeled forecast · approximately 45 km grid and 3-hourly native resolution. API comparison status: ${scenarioStatus ?? 'updating'}. Differences do not establish personal exposure or health-risk changes.` : 'Illustrative values are examples, not live observations or validated forecasts. No numerical difference is presented for illustrative-only comparisons.'}</Disclosure>
-    {dataMode === 'live' && <section className="card live-comparison"><div className="section-heading"><div><div className="eyebrow">WHOLE-PLAN CONCENTRATION-TIME INDEX</div><h2>Plan totals (not activity means)</h2></div><RefreshCw size={18} className="heading-icon"/></div><div className="live-index-row"><span>Baseline whole-plan index</span><b>{comparison?.baseline?.summary?.concentration_time_index ?? 'Unavailable'} <small>µg·h/m³</small></b></div><div className="live-index-row"><span>Alternative whole-plan index</span><b>{scenarioStatus === 'inconclusive' ? (comparison?.alternatives?.[0]?.result?.summary?.concentration_time_index ?? 'Unavailable') : 'Not comparable'} <small>{scenarioStatus === 'inconclusive' ? 'µg·h/m³' : ''}</small></b></div><p className="muted">{scenarioExplanation?.scenario_explanation ?? comparison?.alternatives?.[0]?.comparison_note ?? comparisonError ?? 'Waiting for the API response. No demo value is used in live mode.'}</p>{scenarioExplanation && <p className="muted">{scenarioExplanation.explanation}</p>}</section>}
-    <div className="sim-actions"><button disabled={!run} className="button primary wide" onClick={onApply}><Check size={17}/> Apply to Day Plan</button><button className="button secondary wide" onClick={onReject}>Keep original schedule</button></div>
+
+  return <>
+    <div className="page-intro">
+      <div className="eyebrow"><span className="badge blue"><Compass size={13}/> WHAT-IF SIMULATOR</span></div>
+      <h1>Compare schedule changes</h1>
+      <p>Plan date: {dateLabel(planDate)}. Modeled differences remain inconclusive and do not establish personal exposure changes.</p>
+    </div>
+
+    {!targetBlock && (
+      <div className="api-warning" role="status">
+        The current plan has no flexible outdoor activity eligible for simulation. Select or add a flexible outdoor activity in Today.
+      </div>
+    )}
+
+    {eligibleBlocks.length > 1 && (
+      <section className="card" style={{ padding: '14px 18px', marginBottom: '16px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' }}>
+          <div>
+            <div className="eyebrow">SELECT ACTIVITY TO SIMULATE</div>
+            <strong style={{ fontSize: '13px' }}>Choose from {eligibleBlocks.length} flexible outdoor activities</strong>
+          </div>
+          <select
+            aria-label="Select activity to simulate"
+            value={targetBlock?.id ?? ''}
+            onChange={e => onSelectBlockId(e.target.value)}
+            style={{ padding: '7px 11px', borderRadius: '8px', border: '1px solid var(--line)', background: 'white', color: 'var(--ink)', fontSize: '12px' }}
+          >
+            {eligibleBlocks.map(b => (
+              <option key={b.id} value={b.id}>
+                {b.title} ({clock(b.start)}–{clock(b.end)}) · {b.flexibility}
+              </option>
+            ))}
+          </select>
+        </div>
+      </section>
+    )}
+
+    <section className="card scenario-card">
+      <div className="scenario-top">
+        <span className="round-icon"><Activity size={19}/></span>
+        <div>
+          <div className="eyebrow">MODIFYING ACTIVITY</div>
+          <h2>{targetBlock?.title ?? 'No eligible activity selected'}</h2>
+          <span>{targetBlock ? `${targetBlock.location} · ${clock(targetBlock.start)}–${clock(targetBlock.end)} (${Math.round(duration(targetBlock.start, targetBlock.end) * 60)} min)` : 'No activity'}</span>
+        </div>
+      </div>
+      <div className="eyebrow choice-label">SIMULATION OPTION</div>
+      <div className="choice-group">
+        <button
+          disabled={!targetBlock}
+          className={`choice ${scenario === 'earlier' ? 'chosen' : ''}`}
+          onClick={() => setScenario('earlier')}
+        >
+          <Clock3 size={15}/> Shift window to {clock(shifted.start)}–{clock(shifted.end)}
+        </button>
+        <button
+          disabled={!targetBlock}
+          className={`choice ${scenario === 'indoor' ? 'chosen' : ''}`}
+          onClick={() => setScenario('indoor')}
+        >
+          <Wind size={15}/> Indoor alternative (location change)
+        </button>
+      </div>
+    </section>
+
+    <div className="compare-grid">
+      <div className="compare-card baseline">
+        <span className="eyebrow">CURRENT ACTIVITY · MEAN PM2.5</span>
+        <span className="badge amber">Baseline</span>
+        <h3>{targetBlock ? `${clock(targetBlock.start)}–${clock(targetBlock.end)}` : '—'}</h3>
+        <strong>{baseline == null ? '—' : Number(baseline).toFixed(1)} <small>{baseline == null ? 'not estimated' : `µg/m³${dataMode === 'illustrative' ? '*' : ''}`}</small></strong>
+        <p>{dataMode === 'live' ? 'Modeled activity mean concentration.' : 'Illustrative activity mean concentration.'}</p>
+      </div>
+      <div className="compare-card proposed">
+        <span className="eyebrow">PROPOSED ACTIVITY · {scenario === 'indoor' ? 'LOCATION CHANGE' : 'MEAN PM2.5'}</span>
+        <span className="badge green">Scenario</span>
+        <h3>{scenario === 'earlier' ? `${clock(shifted.start)}–${clock(shifted.end)}` : 'Indoor option'}</h3>
+        <strong>{proposed == null ? '—' : Number(proposed).toFixed(1)} <small>{proposed == null ? 'not estimated' : `µg/m³${dataMode === 'illustrative' ? '*' : ''}`}</small></strong>
+        <p>{proposed == null ? 'No indoor air-quality estimate is available. Outdoor models do not measure indoor air.' : dataMode === 'live' ? 'Modeled activity mean concentration.' : 'Illustrative value only; not a live observation.'}</p>
+      </div>
+    </div>
+
+    <section className="card comparison">
+      <div className="section-heading">
+        <div>
+          <div className="eyebrow">ACTIVITY CONCENTRATION COMPARISON</div>
+          <h2>{scenario === 'indoor' ? 'Indoor data unavailable' : 'Mean PM2.5 by activity time'}</h2>
+        </div>
+        <ArrowDownRight className="heading-icon"/>
+      </div>
+      {scenario === 'earlier' && activityMeanDifference != null ? (
+        <>
+          <div className="bar-compare">
+            <div>
+              <span>Current mean · {Number(baseline).toFixed(1)} µg/m³</span>
+              <div className="bar-track"><i style={{width:'100%'}}/></div>
+            </div>
+            <div>
+              <span>Proposed mean · {Number(proposed).toFixed(1)} µg/m³</span>
+              <div className="bar-track alt"><i style={{width:`${Math.round((baseline ? Number(proposed) / Number(baseline) * 100 : 0))}%`}}/></div>
+            </div>
+          </div>
+          <p className="muted">Difference between these activity mean concentrations: {activityMeanDifference.toFixed(1)} µg/m³. The API marks this live comparison inconclusive; it is not an exposure or health result.</p>
+        </>
+      ) : (
+        <p className="muted">
+          {comparisonError || (scenario === 'indoor'
+            ? 'No indoor measurement or validated model is available. Outdoor air quality models do not reflect indoor conditions.'
+            : comparison
+              ? `No numerical difference is shown for API status “${scenarioStatus ?? 'unknown'}”; supported intervals are not comparable.`
+              : 'Waiting for comparable API results. No numerical difference is shown while the request is pending.')}
+        </p>
+      )}
+    </section>
+
+    <Disclosure>
+      {scenario === 'indoor'
+        ? 'Indoor alternatives represent an activity/location change. Outdoor modeled atmospheric data does not measure indoor air quality or personal protection.'
+        : dataMode === 'live'
+          ? `CAMS Global modeled forecast · approximately 45 km grid and 3-hourly native resolution. API comparison status: ${scenarioStatus ?? 'updating'}. Differences do not establish personal exposure or health-risk changes.`
+          : 'Illustrative values are examples, not live observations or validated forecasts. No numerical difference is presented for illustrative-only comparisons.'}
+    </Disclosure>
+
+    {dataMode === 'live' && (
+      <section className="card live-comparison">
+        <div className="section-heading">
+          <div>
+            <div className="eyebrow">WHOLE-PLAN CONCENTRATION-TIME INDEX</div>
+            <h2>Plan totals (not activity means)</h2>
+          </div>
+          <RefreshCw size={18} className="heading-icon"/>
+        </div>
+        <div className="live-index-row">
+          <span>Baseline whole-plan index</span>
+          <b>{comparison?.baseline?.summary?.concentration_time_index ?? 'Unavailable'} <small>µg·h/m³</small></b>
+        </div>
+        <div className="live-index-row">
+          <span>Alternative whole-plan index</span>
+          <b>{scenarioStatus === 'inconclusive' ? (comparison?.alternatives?.[0]?.result?.summary?.concentration_time_index ?? 'Unavailable') : 'Not comparable'} <small>{scenarioStatus === 'inconclusive' ? 'µg·h/m³' : ''}</small></b>
+        </div>
+        <p className="muted">{scenarioExplanation?.scenario_explanation ?? comparison?.alternatives?.[0]?.comparison_note ?? comparisonError ?? 'Waiting for the API response. No demo value is used in live mode.'}</p>
+        {scenarioExplanation && <p className="muted">{scenarioExplanation.explanation}</p>}
+      </section>
+    )}
+
+    <div className="sim-actions">
+      <button disabled={!targetBlock} className="button primary wide" onClick={onApply}>
+        <Check size={17}/> Apply to Day Plan
+      </button>
+      <button className="button secondary wide" onClick={onReject}>
+        Keep original schedule
+      </button>
+    </div>
   </>
 }
 
@@ -215,13 +530,32 @@ function Impact({ state, update, projected, blocks, planDate, dataMode }: { stat
   }
   const options = ['Accepted', 'Modified', 'Rejected']
   const constrainedBlocks = blocks.filter(block => block.flexibility !== 'Flexible')
-  return <><div className="page-intro"><div className="eyebrow">THIS PLAN’S FEEDBACK</div><h1>Plan feedback</h1><p>Record whether this schedule prompt fits your routine. Choices are self-reported and do not demonstrate a health outcome.</p></div>
+  return <>
+    <div className="page-intro">
+      <div className="eyebrow">THIS PLAN’S FEEDBACK</div>
+      <h1>Plan feedback</h1>
+      <p>Record whether this schedule prompt fits your routine. Choices are self-reported and do not demonstrate a health outcome.</p>
+    </div>
+
+    <section className="card" style={{ padding: '18px 20px', marginBottom: '16px', background: '#f8fafc', border: '1px solid var(--line)' }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: '12px' }}>
+        <span className="round-icon" style={{ background: '#f1f5f9', color: 'var(--muted)' }}><CircleHelp size={18}/></span>
+        <div>
+          <div className="eyebrow" style={{ color: 'var(--muted)' }}>FEATURE STATUS · DISABLED</div>
+          <h2 style={{ fontSize: '15px', margin: '4px 0 2px' }}>Cigarette-equivalent metric is disabled</h2>
+          <p style={{ fontSize: '12px', color: 'var(--muted)', margin: 0, lineHeight: 1.55 }}>
+            No validated conversion methodology exists between ambient PM2.5 concentration and inhaled cigarette equivalents. Prana does not compute or display fabricated equivalent values.
+          </p>
+        </div>
+      </div>
+    </section>
+
     <section className="feedback-card"><div className="eyebrow">SCHEDULE PROMPT · {dateLabel(planDate).toUpperCase()}</div>{flexibleOutdoor ? <><h2>Would comparing another time for {flexibleOutdoor.title} work for you?</h2><p>Record whether comparing or changing the time fits your schedule.</p><div className="feedback-options">{options.map(x => <button key={x} className={`choice ${state.feedback === x ? 'chosen' : ''}`} onClick={() => { update({ feedback: x }); record(x) }}>{state.feedback === x && <Check size={14}/>} {x}</button>)}</div>{state.feedback && <div className="feedback-confirm"><Check size={15}/> This plan’s response is stored in this browser: {state.feedback.toLowerCase()}.</div>}</> : <><h2>No flexible outdoor activity in this plan</h2><p>There is no schedule comparison prompt to record for this date.</p></>}</section>
     <div className="section-title-row impact-title"><div><div className="eyebrow">CURRENT PLAN · {dateLabel(planDate).toUpperCase()}</div><h2>Recorded choices</h2></div><span className="badge neutral">Browser-local</span></div>
     <div className="stats-grid"><div className="stat-card"><span>Decision for this plan</span><strong>{state.feedback || 'None'}</strong></div><div className="stat-card"><span>Self-reported follow-through</span><strong>{state.followed || 'Not recorded'}</strong></div><div className="stat-card"><span>Plan ambient concentration-time index</span><strong>{projected == null ? '—' : Math.round(projected)}<small>µg·h/m³</small></strong></div></div>
     <section className="card follow-card"><div className="section-heading"><div><div className="eyebrow">SELF-REPORTED FOLLOW-THROUGH</div><h2>Did you make the change?</h2></div><HeartPulse size={20} className="heading-icon"/></div>{flexibleOutdoor ? <><p>This is a self-report, not a measurement or verification.</p><div className="feedback-options">{['Followed', 'Partially', 'Not followed'].map(x => <button key={x} className={`choice ${state.followed === x ? 'chosen' : ''}`} onClick={() => { update({ followed: x }); record(state.feedback || 'Kept', x === 'Followed' ? 'complete' : x === 'Partially' ? 'partial' : 'not_followed') }}>{x}</button>)}</div>{state.followed && <div className="feedback-confirm"><Check size={15}/> Self-reported as “{state.followed.toLowerCase()}”.</div>}</> : <p>No flexible outdoor activity is available to associate with a follow-through response.</p>}</section>
     <section className="card constraint-card"><div className="section-heading"><div><div className="eyebrow">SCHEDULE CONSTRAINTS</div><h2>Activities marked fixed or limited</h2></div><SlidersHorizontal size={19} className="heading-icon"/></div>{constrainedBlocks.length ? constrainedBlocks.map(block => <div className="constraint-row" key={block.id}><span className="constraint-icon"><Clock3 size={16}/></span><div><b>{block.title} · {clock(block.start)}–{clock(block.end)}</b><p>Constraint recorded in this plan.</p></div><span className={`badge ${block.flexibility === 'Fixed' ? 'blue' : 'amber'}`}>{block.flexibility}</span></div>) : <p className="muted">No activities are marked fixed or limited in this plan.</p>}</section>
-    <section className="metric-card"><div className="metric-kicker">PLAN ESTIMATE SUMMARY <span className="badge neutral">{report?.report_status ?? 'Provisional'}</span></div><h2>Supported modeled intervals</h2><p>{report ? `${report.summary.evaluated_blocks} supported block(s), ${report.summary.excluded_blocks} excluded. Coverage: ${Math.round(report.summary.coverage_fraction * 100)}%.` : `${projected == null ? '—' : Math.round(projected)} µg·h/m³ ambient concentration-time index for this plan.`}</p><p>This is a plan estimate, not a record of completed activity. Cigarette-equivalent output remains disabled.</p><button className="text-button" onClick={() => update({ page: 'Insights' })}>Review data and assumptions <ArrowRight size={15}/></button></section>
+    <section className="metric-card"><div className="metric-kicker">PLAN ESTIMATE SUMMARY <span className="badge neutral">{report?.report_status ?? 'Provisional'}</span></div><h2>Supported modeled intervals</h2><p>{report ? `${report.summary.evaluated_blocks} supported block(s), ${report.summary.excluded_blocks} excluded. Coverage: ${Math.round(report.summary.coverage_fraction * 100)}%.` : `${projected == null ? '—' : Math.round(projected)} µg·h/m³ ambient concentration-time index for this plan.`}</p><p>This is a plan estimate, not a record of completed activity.</p><button className="text-button" onClick={() => update({ page: 'Insights' })}>Review data and assumptions <ArrowRight size={15}/></button></section>
     <Disclosure>Feedback choices are stored in this browser for the selected plan date. The API does not retain impact history. Self-reported follow-through is not verification of ambient conditions or personal exposure.</Disclosure>
   </>
 }

@@ -94,9 +94,14 @@ class FeedbackRequest(BaseModel):
 app = FastAPI(title="Prana API", version="0.2.0", description="Deterministic ambient air planning API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+    ],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 open_meteo = OpenMeteoService()
@@ -208,10 +213,54 @@ def _integrate_block(request: DayAnalysisRequest, block: PlanBlock, series: Hour
     }
 
 
+
+def _generate_recommendations(request: DayAnalysisRequest, evaluated: list[dict], data_mode: str) -> list[dict]:
+    evaluated_ids = {row["block_id"] for row in evaluated}
+    eligible_blocks = [
+        block for block in request.blocks
+        if block.environment == Environment.outdoor
+        and block.id in evaluated_ids
+        and block.flexibility != Flexibility.fixed
+    ]
+    if not eligible_blocks:
+        return []
+
+    def sort_key(b: PlanBlock):
+        flex_rank = 0 if b.flexibility == Flexibility.flexible else 1
+        return (flex_rank, -block_hours(b), b.start, b.id)
+
+    eligible_blocks.sort(key=sort_key)
+
+    recommendations = []
+    for block in eligible_blocks:
+        duration_min = int(round(block_hours(block) * 60))
+        start_str = block.start.strftime("%H:%M")
+        end_str = block.end.strftime("%H:%M")
+        if data_mode == "illustrative":
+            status = "illustrative_only"
+            reason = (
+                f"'{block.title}' ({start_str}–{end_str}, {duration_min} min) is an outdoor block marked {block.flexibility.value}. "
+                "You can compare example times, but illustrative values do not describe local conditions."
+            )
+        else:
+            status = "comparison_prompt"
+            reason = (
+                f"'{block.title}' ({start_str}–{end_str}, {duration_min} min) is an outdoor block marked {block.flexibility.value}. "
+                "Compare another time if it fits your schedule; regional modeled estimates cannot establish a personal exposure difference."
+            )
+        recommendations.append({
+            "id": f"compare-{block.id}",
+            "block_id": block.id,
+            "kind": "compare_alternative_window",
+            "status": status,
+            "reason": reason,
+        })
+    return recommendations
+
+
 def calculate_live(request: DayAnalysisRequest, series: HourlySeries) -> dict:
     evaluated: list[dict] = []
     excluded: list[dict] = []
-    recommendations: list[dict] = []
     outdoor_planned = sum(block_hours(block) for block in request.blocks if block.environment == Environment.outdoor)
     for block in request.blocks:
         if block.environment != Environment.outdoor:
@@ -222,14 +271,7 @@ def calculate_live(request: DayAnalysisRequest, series: HourlySeries) -> dict:
             excluded.append(result["excluded"])
             continue
         evaluated.append(result)
-        if block.flexibility != Flexibility.fixed:
-            recommendations.append({
-                "id": f"compare-{block.id}",
-                "block_id": block.id,
-                "kind": "compare_alternative_window",
-                "status": "comparison_prompt",
-                "reason": "This outdoor block is marked flexible. Compare another time if it fits your schedule; regional modeled estimates cannot establish a personal exposure difference.",
-            })
+    recommendations = _generate_recommendations(request, evaluated, data_mode="live")
     total = round(sum(row["concentration_time_index_ug_h_m3"] for row in evaluated), 4) if evaluated else None
     supported = round(sum(row["estimated_hours"] for row in evaluated), 4)
     provenance = _base_provenance(request)
@@ -268,7 +310,6 @@ def calculate_live(request: DayAnalysisRequest, series: HourlySeries) -> dict:
 def calculate_illustrative(request: DayAnalysisRequest) -> dict:
     evaluated = []
     excluded = []
-    recommendations = []
     for block in request.blocks:
         if block.environment != Environment.outdoor:
             excluded.append({"block_id": block.id, "reason": f"{block.environment.value}_ambient_concentration_not_estimated"})
@@ -289,8 +330,7 @@ def calculate_illustrative(request: DayAnalysisRequest) -> dict:
             "coverage_fraction": 1,
             "evidence_type": "illustrative_mock",
         })
-        if block.flexibility != Flexibility.fixed:
-            recommendations.append({"id": f"compare-{block.id}", "block_id": block.id, "kind": "compare_alternative_window", "status": "illustrative_only", "reason": "This outdoor block is marked flexible. You can compare example times, but illustrative values do not describe local conditions."})
+    recommendations = _generate_recommendations(request, evaluated, data_mode="illustrative")
     total = round(sum(row["concentration_time_index_ug_h_m3"] for row in evaluated), 4) if evaluated else None
     outdoor = sum(block_hours(block) for block in request.blocks if block.environment == Environment.outdoor)
     supported = sum(row["estimated_hours"] for row in evaluated)
@@ -390,5 +430,6 @@ def end_of_day(request: DayAnalysisRequest):
 
 
 @app.post("/api/explanations")
+@app.post("/api/insights")
 def explain(payload: ExplanationRequest):
     return bedrock_explanations.explain(payload)

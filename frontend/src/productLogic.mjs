@@ -88,6 +88,18 @@ export function comparableScenarioDifference(status, baselineMean, alternativeMe
   return baselineMean - alternativeMean
 }
 
+export function defaultScenarioSelection() {
+  return 'earlier'
+}
+
+export function comparisonRequestKey(planDate, dataMode, scenario, targetBlockId, shifted, blocks) {
+  return JSON.stringify([planDate, dataMode, scenario, targetBlockId, shifted, blocks])
+}
+
+export function explanationRequestKey(planDate, dataMode, blocks, scenario = null) {
+  return JSON.stringify([planDate, dataMode, blocks, scenario])
+}
+
 export function classifyApiFailure(error) {
   if (error?.name === 'AbortError') return null
   if (error?.name === 'TypeError') return 'Could not connect to the Prana API. Check that FastAPI is running and VITE_API_URL is correct.'
@@ -124,4 +136,80 @@ export function derivePlanFinding({ analysis, blocks, dataMode, busy, error }) {
   return analysis.status === 'partial'
     ? { headline: 'Partial data coverage for this plan', body: `${body} Other intervals remain unknown.`, state: 'partial' }
     : { headline: 'Supported outdoor estimates for this plan', body, state: 'available' }
+}
+
+export function timeGreeting(now = new Date()) {
+  const hour = now.getHours()
+  if (hour >= 5 && hour < 12) return 'Good morning'
+  if (hour >= 12 && hour < 17) return 'Good afternoon'
+  return 'Good evening'
+}
+
+export function calculateShiftedWindow(start, end) {
+  const [sh, sm] = start.split(':').map(Number)
+  const [eh, em] = end.split(':').map(Number)
+  const startMins = sh * 60 + sm
+  const endMins = eh * 60 + em
+  const durMins = Math.max(15, endMins - startMins)
+
+  let candidateStartMins
+  if (startMins >= 16 * 60) {
+    candidateStartMins = Math.max(6 * 60, startMins - 90)
+  } else if (startMins < 12 * 60) {
+    candidateStartMins = Math.min(20 * 60, startMins + 180)
+  } else {
+    candidateStartMins = startMins >= 14 * 60 ? startMins - 120 : startMins + 120
+  }
+
+  const candidateEndMins = candidateStartMins + durMins
+  const formatTime = (mins) => {
+    const h = Math.floor(mins / 60) % 24
+    const m = mins % 60
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+  }
+
+  return {
+    start: formatTime(candidateStartMins),
+    end: formatTime(candidateEndMins),
+  }
+}
+
+export function applyScenarioToState(state, targetBlockId, scenarioUpdates) {
+  const targetBlock = state.blocks?.find(b => b.id === targetBlockId)
+  if (!targetBlock) {
+    return { success: false, error: 'Activity not found in current plan.', state }
+  }
+
+  const proposed = { ...targetBlock, ...scenarioUpdates }
+  if (proposed.end <= proposed.start) {
+    return { success: false, error: 'End time must be later than start time.', state }
+  }
+
+  const conflict = state.blocks.find(b => b.id !== targetBlockId && proposed.start < b.end && b.start < proposed.end)
+  if (conflict) {
+    return { success: false, error: `This activity overlaps “${conflict.title}”. Adjust the time before applying.`, state }
+  }
+
+  const nextBlocks = state.blocks.map(b => b.id === targetBlockId ? proposed : b)
+  nextBlocks.sort((a, b) => a.start.localeCompare(b.start))
+
+  const currentPlan = state.plansByDate?.[state.planDate] ?? {}
+  const plansByDate = {
+    ...state.plansByDate,
+    [state.planDate]: {
+      ...currentPlan,
+      blocks: nextBlocks,
+      feedback: state.feedback ?? '',
+      followed: state.followed ?? '',
+    },
+  }
+
+  const nextState = {
+    ...state,
+    blocks: nextBlocks,
+    plansByDate,
+    page: 'Today',
+  }
+
+  return { success: true, state: nextState }
 }

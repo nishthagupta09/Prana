@@ -3,12 +3,18 @@ import assert from 'node:assert/strict'
 import {
   analysisForRequest,
   analysisRequestKey,
+  applyScenarioToState,
+  calculateShiftedWindow,
   classifyApiFailure,
   comparableScenarioDifference,
+  comparisonRequestKey,
+  defaultScenarioSelection,
   derivePlanFinding,
+  explanationRequestKey,
   loadStoredState,
   selectPlanDate,
   stateForStorage,
+  timeGreeting,
 } from '../src/productLogic.mjs'
 
 const starter = [{ id: 'run', title: 'Run' }]
@@ -96,4 +102,171 @@ test('Insights reports API connection failures distinctly from provider outages'
   assert.match(connectionError, /Could not connect to the Prana API/)
   assert.match(classifyApiFailure(Object.assign(new Error('bad request'), { status: 422 })), /HTTP 422/)
   assert.equal(classifyApiFailure(Object.assign(new Error('cancelled'), { name: 'AbortError' })), null)
+})
+
+test('timeGreeting returns appropriate greeting based on local hour', () => {
+  const morning = new Date(2026, 9, 11, 8, 30)
+  const afternoon = new Date(2026, 9, 11, 14, 0)
+  const evening = new Date(2026, 9, 11, 19, 45)
+  const night = new Date(2026, 9, 11, 23, 10)
+  assert.equal(timeGreeting(morning), 'Good morning')
+  assert.equal(timeGreeting(afternoon), 'Good afternoon')
+  assert.equal(timeGreeting(evening), 'Good evening')
+  assert.equal(timeGreeting(night), 'Good evening')
+})
+
+test('calculateShiftedWindow preserves duration and calculates valid candidate window', () => {
+  // 60 min evening window shifts earlier
+  const eveningShift = calculateShiftedWindow('17:30', '18:30')
+  assert.equal(eveningShift.start, '16:00')
+  assert.equal(eveningShift.end, '17:00')
+
+  // 45 min morning window shifts later
+  const morningShift = calculateShiftedWindow('08:00', '08:45')
+  assert.equal(morningShift.start, '11:00')
+  assert.equal(morningShift.end, '11:45')
+
+  // Exact duration preserved
+  const [sh, sm] = morningShift.start.split(':').map(Number)
+  const [eh, em] = morningShift.end.split(':').map(Number)
+  assert.equal((eh * 60 + em) - (sh * 60 + sm), 45)
+})
+
+test('applyScenarioToState updates non-run activity, sorts chronologically, and updates date-keyed plans atomically', () => {
+  const state = {
+    planDate: '2026-10-11',
+    page: 'Simulator',
+    feedback: 'Accepted',
+    followed: 'Followed',
+    blocks: [
+      { id: 'commute', title: 'Commute', start: '08:00', end: '09:00', location: 'Metro', environment: 'Outdoor', flexibility: 'Limited', pm25: 80 },
+      { id: 'cycle', title: 'Cycling', start: '18:00', end: '19:00', location: 'Park', environment: 'Outdoor', flexibility: 'Flexible', pm25: 120 },
+      { id: 'dinner', title: 'Dinner', start: '20:00', end: '21:00', location: 'Cafe', environment: 'Indoor', flexibility: 'Flexible', pm25: null },
+    ],
+    plansByDate: {
+      '2026-10-11': {
+        blocks: [
+          { id: 'commute', title: 'Commute', start: '08:00', end: '09:00', location: 'Metro', environment: 'Outdoor', flexibility: 'Limited', pm25: 80 },
+          { id: 'cycle', title: 'Cycling', start: '18:00', end: '19:00', location: 'Park', environment: 'Outdoor', flexibility: 'Flexible', pm25: 120 },
+          { id: 'dinner', title: 'Dinner', start: '20:00', end: '21:00', location: 'Cafe', environment: 'Indoor', flexibility: 'Flexible', pm25: null },
+        ],
+        feedback: 'Accepted',
+        followed: 'Followed',
+      },
+    },
+  }
+
+  // Update non-run activity 'cycle' to earlier window 16:00-17:00
+  const result = applyScenarioToState(state, 'cycle', { start: '16:00', end: '17:00' })
+  assert.equal(result.success, true)
+  assert.equal(result.state.page, 'Today')
+
+  // Chronological ordering preserved: commute (08:00), cycle (16:00), dinner (20:00)
+  assert.deepEqual(result.state.blocks.map(b => b.id), ['commute', 'cycle', 'dinner'])
+  assert.equal(result.state.blocks[1].start, '16:00')
+  assert.equal(result.state.blocks[1].end, '17:00')
+
+  // Date-keyed persistence updated atomically
+  assert.deepEqual(result.state.plansByDate['2026-10-11'].blocks.map(b => b.id), ['commute', 'cycle', 'dinner'])
+  assert.equal(result.state.plansByDate['2026-10-11'].blocks[1].start, '16:00')
+  assert.equal(result.state.plansByDate['2026-10-11'].feedback, 'Accepted')
+
+  // Unrelated activities preserved
+  assert.equal(result.state.blocks[0].title, 'Commute')
+  assert.equal(result.state.blocks[2].title, 'Dinner')
+})
+
+test('applyScenarioToState rejects schedule overlaps and reversed times without changing state', () => {
+  const state = {
+    planDate: '2026-10-11',
+    page: 'Simulator',
+    blocks: [
+      { id: 'work', title: 'Work', start: '09:00', end: '17:00', location: 'Office', environment: 'Indoor', flexibility: 'Fixed', pm25: null },
+      { id: 'walk', title: 'Walk', start: '18:00', end: '19:00', location: 'Park', environment: 'Outdoor', flexibility: 'Flexible', pm25: 60 },
+    ],
+    plansByDate: {},
+  }
+
+  // Overlap test: shift walk to 16:00-17:00 (overlaps Work 09:00-17:00)
+  const overlapResult = applyScenarioToState(state, 'walk', { start: '16:00', end: '17:00' })
+  assert.equal(overlapResult.success, false)
+  assert.match(overlapResult.error, /overlaps “Work”/)
+  assert.deepEqual(overlapResult.state, state)
+  assert.equal(overlapResult.state.page, 'Simulator')
+
+  // Reversed/invalid time test: start 19:00, end 18:00
+  const invalidTimeResult = applyScenarioToState(state, 'walk', { start: '19:00', end: '18:00' })
+  assert.equal(invalidTimeResult.success, false)
+  assert.match(invalidTimeResult.error, /End time must be later than start time/)
+  assert.deepEqual(invalidTimeResult.state, state)
+
+  // Non-existent activity test
+  const missingResult = applyScenarioToState(state, 'unknown-id', { start: '07:00', end: '08:00' })
+  assert.equal(missingResult.success, false)
+  assert.match(missingResult.error, /Activity not found/)
+  assert.deepEqual(missingResult.state, state)
+})
+
+test('defaultScenarioSelection defaults to shifted-time option and indoor option remains selectable', () => {
+  // Shifted-time ('earlier') is selected by default
+  assert.equal(defaultScenarioSelection(), 'earlier')
+
+  // Available options
+  const options = ['earlier', 'indoor']
+  assert.ok(options.includes(defaultScenarioSelection()))
+  assert.ok(options.includes('indoor'))
+})
+
+test('switching activities, dates, scenarios, or modes produces distinct comparison keys preventing stale cache reuse', () => {
+  const blocks = [
+    { id: 'run', title: 'Run', start: '17:30', end: '18:30', environment: 'Outdoor', flexibility: 'Flexible', pm25: 185 },
+    { id: 'walk', title: 'Walk', start: '07:00', end: '08:00', environment: 'Outdoor', flexibility: 'Flexible', pm25: 90 },
+  ]
+  const shiftedRun = calculateShiftedWindow('17:30', '18:30')
+  const shiftedWalk = calculateShiftedWindow('07:00', '08:00')
+
+  const baseKey = comparisonRequestKey('2026-10-11', 'live', 'earlier', 'run', shiftedRun, blocks)
+  const differentDateKey = comparisonRequestKey('2026-10-12', 'live', 'earlier', 'run', shiftedRun, blocks)
+  const differentActivityKey = comparisonRequestKey('2026-10-11', 'live', 'earlier', 'walk', shiftedWalk, blocks)
+  const indoorScenarioKey = comparisonRequestKey('2026-10-11', 'live', 'indoor', 'run', shiftedRun, blocks)
+  const illustrativeModeKey = comparisonRequestKey('2026-10-11', 'illustrative', 'earlier', 'run', shiftedRun, blocks)
+
+  const keys = new Set([baseKey, differentDateKey, differentActivityKey, indoorScenarioKey, illustrativeModeKey])
+  assert.equal(keys.size, 5, 'All keys must be mutually distinct')
+
+  // analysisForRequest correctly rejects stale cached results across key boundaries
+  const cachedComparison = { requestKey: baseKey, result: { difference_ug_h_m3: 15 } }
+  assert.equal(analysisForRequest(cachedComparison, differentDateKey), null)
+  assert.equal(analysisForRequest(cachedComparison, differentActivityKey), null)
+  assert.equal(analysisForRequest(cachedComparison, indoorScenarioKey), null)
+  assert.equal(analysisForRequest(cachedComparison, illustrativeModeKey), null)
+  assert.deepEqual(analysisForRequest(cachedComparison, baseKey), { difference_ug_h_m3: 15 })
+})
+
+test('explanationRequestKey distinguishes dates, data modes, and plan blocks avoiding stale explanation caching', () => {
+  const blocksA = [{ id: 'run', title: 'Run', start: '17:00', end: '18:00', environment: 'Outdoor' }]
+  const blocksB = [{ id: 'walk', title: 'Walk', start: '08:00', end: '09:00', environment: 'Outdoor' }]
+
+  const key1 = explanationRequestKey('2026-10-11', 'live', blocksA)
+  const key2 = explanationRequestKey('2026-10-12', 'live', blocksA)
+  const key3 = explanationRequestKey('2026-10-11', 'illustrative', blocksA)
+  const key4 = explanationRequestKey('2026-10-11', 'live', blocksB)
+
+  const keys = new Set([key1, key2, key3, key4])
+  assert.equal(keys.size, 4, 'All explanation keys must be mutually distinct')
+
+  const bedrockExplanation = {
+    headline: 'Plan estimate summary',
+    explanation: 'Supported outdoor periods are summarized.',
+    next_step: 'Review the source details.',
+    provider: 'bedrock',
+    status: 'generated',
+  }
+  const cachedRecord = { requestKey: key1, result: bedrockExplanation }
+
+  assert.deepEqual(analysisForRequest(cachedRecord, key1), bedrockExplanation)
+  assert.equal(analysisForRequest(cachedRecord, key2), null)
+  assert.equal(analysisForRequest(cachedRecord, key3), null)
+  assert.equal(analysisForRequest(cachedRecord, key4), null)
+  assert.equal(analysisForRequest(cachedRecord, key1, true), null, 'Pending explanation request must not return stale result')
 })

@@ -1,0 +1,16 @@
+{
+  "modelId": "apac.amazon.nova-lite-v1:0",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "text": "Reply with OK"
+        }
+      ]
+    }
+  ],
+  "inferenceConfig": {
+    "maxTokens": 20
+  }
+}

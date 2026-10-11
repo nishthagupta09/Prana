@@ -172,5 +172,36 @@ class BedrockExplanationTests(unittest.TestCase):
         client.converse.assert_not_called()
 
 
+    def test_fastapi_insights_route_alias_returns_identical_structure(self):
+        client = Mock()
+        client.converse.return_value = converse_response(json.dumps({
+            "headline": "Plan estimate summary",
+            "explanation": "Supported outdoor periods are summarized; missing periods remain unknown.",
+            "next_step": "Review the source coverage details.",
+        }))
+        previous = api.bedrock_explanations
+        api.bedrock_explanations = BedrockExplanationService(client=client, region="us-east-1", model_id="sample-model")
+        try:
+            async def post_insights():
+                async with AsyncClient(transport=ASGITransport(app=api.app), base_url="http://test") as test_client:
+                    return await test_client.post("/api/insights", json=explanation_request().model_dump(mode="json"))
+
+            response = asyncio.run(post_insights())
+        finally:
+            api.bedrock_explanations = previous
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["provider"], "bedrock")
+        self.assertEqual(body["status"], "generated")
+
+    def test_fastapi_insights_route_rejects_invalid_payload_with_422(self):
+        async def post_invalid():
+            async with AsyncClient(transport=ASGITransport(app=api.app), base_url="http://test") as test_client:
+                return await test_client.post("/api/insights", json={"analysis": {"invalid": True}})
+
+        response = asyncio.run(post_invalid())
+        self.assertEqual(response.status_code, 422)
+
+
 if __name__ == "__main__":
     unittest.main()
